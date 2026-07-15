@@ -41,17 +41,12 @@ from html.parser import HTMLParser
 from datetime import datetime
 
 # ── Optional: Try to use FastAPI, fall back to Flask-style if not available ──
-try:
-    from fastapi import FastAPI, HTTPException, Request
-    from fastapi.responses import JSONResponse
-    from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel, Field
-    import uvicorn
-    USE_FASTAPI = True
-except ImportError:
-    USE_FASTAPI = False
-    print("[!] FastAPI not found. Install with: pip install fastapi uvicorn")
-    print("[!] Running in CLI mode only.")
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+import uvicorn
+USE_FASTAPI = True
 
 try:
     from bs4 import BeautifulSoup
@@ -536,12 +531,19 @@ class IMPDSSession:
         self._lock = threading.Lock()
         self._auto_creds = auto_credentials  # {username, password} for zero-friction mode
         
-        # Try to restore a saved session from disk
-        self._try_restore_session()
-        
-        # Start keep-alive background thread
-        self._start_keepalive()
+        self._initialized = False
     
+    def _lazy_init(self):
+        """Perform delayed initialization (session restore & keep-alive thread)."""
+        if not self._initialized:
+            with self._lock:
+                if not self._initialized:
+                    self._initialized = True
+                    # Try to restore a saved session from disk
+                    self._try_restore_session()
+                    # Start keep-alive background thread
+                    self._start_keepalive()
+
     def _try_restore_session(self):
         """Attempt to restore a previously saved session."""
         # 1. Try to load from cookie.txt first if it exists
@@ -633,6 +635,7 @@ class IMPDSSession:
     
     def get_login_page(self) -> dict:
         """Fetch login page, extract CSRF + salt."""
+        self._lazy_init()
         r = self.session.get(f"{BASE_URL}/")
         r.raise_for_status()
         
@@ -657,6 +660,7 @@ class IMPDSSession:
     
     def login(self, username: str, password: str, captcha: str) -> dict:
         """Perform login with hashed password."""
+        self._lazy_init()
         with self._lock:
             if not self.csrf_token or not self.salt:
                 self.get_login_page()
@@ -742,6 +746,7 @@ class IMPDSSession:
         ZERO-FRICTION LOGIN — auto-solves captcha with OCR.
         Retries up to max_retries times if OCR misreads the captcha.
         """
+        self._lazy_init()
         username = username or (self._auto_creds or {}).get('username') or self.username
         password = password or (self._auto_creds or {}).get('password') or self.password
         
@@ -788,6 +793,7 @@ class IMPDSSession:
         Ensure we have an active session. Auto-reauth if needed.
         Returns True if logged in, False if we can't auto-login.
         """
+        self._lazy_init()
         if self.logged_in:
             # Verify session is still alive
             try:
@@ -913,6 +919,7 @@ class IMPDSSession:
     
     def get_status(self) -> dict:
         """Check current session status."""
+        self._lazy_init()
         return {
             "logged_in": self.logged_in,
             "username": self.username,
@@ -923,6 +930,7 @@ class IMPDSSession:
     
     def logout(self) -> dict:
         """Logout from the portal."""
+        self._lazy_init()
         if self.logged_in:
             try:
                 self.session.get(f"{BASE_URL}/logout")
