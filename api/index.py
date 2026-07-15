@@ -240,8 +240,7 @@ def clean_parsed_search_results(result: dict) -> dict:
             "home_fps": None
         },
         "members": [],
-        "status_metrics": {},
-        "raw_tables": result.get("raw_tables", [])
+        "status_metrics": {}
     }
     
     if result.get("message"):
