@@ -41,12 +41,9 @@ from html.parser import HTMLParser
 from datetime import datetime
 
 # ── Optional: Try to use FastAPI, fall back to Flask-style if not available ──
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-import uvicorn
-USE_FASTAPI = True
+from flask import Flask, jsonify, request, abort
+from flask_cors import CORS
+USE_FASTAPI = False
 
 try:
     from bs4 import BeautifulSoup
@@ -969,8 +966,7 @@ AVAILABLE_REPORTS = [
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# FASTAPI SERVER
-# ═══════════════════════════════════════════════════════════════════════════
+
 
 # Default credentials — server auto-logs in on startup
 DEFAULT_CREDS = {
@@ -981,287 +977,233 @@ DEFAULT_CREDS = {
 # Global session instance (with auto-credentials)
 impds = IMPDSSession(auto_credentials=DEFAULT_CREDS)
 
-if USE_FASTAPI:
-    app = FastAPI(
-        title="IMPDS Deduplication API",
-        description="Reverse-engineered JSON API for the IMPDS Deduplication Portal",
-        version="1.0.0",
-        docs_url=None
-    )
-    
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app = Flask(__name__)
+CORS(app)
 
-    # ── Response Models ──
-    class FamilyMemberResponse(BaseModel):
-        s_no: int | str = Field(..., description="Serial number of the family member")
-        member_id: str | None = Field(None, description="Unique member ID")
-        member_name: str = Field(..., description="Name of the family member")
-        gender: str | None = Field(None, description="Gender of the member")
-        uid: str | None = Field(None, description="Masked Aadhaar UID")
-        relationship: str | None = Field(None, description="Relationship with head of family")
+@app.route("/docs", methods=["GET"])
+def custom_docs():
+    """Returns all available API endpoints with author credits in JSON format."""
+    return jsonify({
+        "success": True,
+        "api_by": "t.me/Sudhirxd",
+        "website": "www.sudhirxd.in",
+        "endpoints": [
+            "/aadhaar/<aadhaar_number>",
+            "/rc/<card_number>",
+            "/rc/summary/<card_number>"
+        ]
+    })
 
-        ekyc_status: str | None = Field(None, description="eKYC status")
-        cr_last_updated: str | None = Field(None, description="Last updated date in Central Repository")
-        remark: str = Field("", description="Any remark for the member")
+@app.route("/api/health", methods=["GET"])
+def health():
+    """Check API health and session status."""
+    status = impds.get_status()
+    status["api_version"] = "1.0.0"
+    status["encryption_method"] = "CryptoJS AES-256-CBC"
+    return jsonify(status)
 
-    class StatusMetricsResponse(BaseModel):
-        ration_card_allowed_for_impds_transaction: bool | None = Field(None)
-        ration_card_associated_fps_comes_under_offline_fps_category: bool | None = Field(None)
-        ration_card_beneficiary_with_duplicate_aadaar_number: bool | None = Field(None)
-        ration_card_exists_in_central_repository: bool | None = Field(None)
+@app.route("/api/captcha", methods=["GET"])
+def get_captcha():
+    """
+    Get a fresh captcha image. Call this before /api/login.
+    Returns base64-encoded JPG image.
+    """
+    impds.get_login_page()  # Also refreshes CSRF
+    captcha = impds.get_captcha()
+    return jsonify({
+        "captcha_image": f"data:image/jpg;base64,{captcha['captcha_base64']}",
+        "captcha_base64": captcha["captcha_base64"],
+        "instructions": "Decode the image and send the text to POST /api/login"
+    })
 
-    class CardDetails(BaseModel):
-        ration_card_number: str | None = Field(None, description="Ration card number")
-        state_name: str | None = Field(None, description="State Name")
-        district_name: str | None = Field(None, description="District Name")
-        scheme_name: str | None = Field(None, description="Scheme Name")
-        card_type: str | None = Field(None, description="Card Type (e.g. PHH, AAY)")
-        issue_date: str | None = Field(None, description="Ration card issue date")
-        address: str | None = Field(None, description="Card holder's address")
-        home_fps: str | None = Field(None, description="FPS ID and Owner name")
+@app.route("/api/login", methods=["POST"])
+def login_handler():
+    """
+    Login to IMPDS portal (manual captcha).
+    First call GET /api/captcha, solve it, then POST here.
+    """
+    data = request.json or {}
+    username = data.get("username")
+    password = data.get("password")
+    captcha = data.get("captcha")
+    
+    if not username or not password or not captcha:
+        return jsonify({"success": False, "error": "username, password, and captcha are required"}), 400
+        
+    result = impds.login(username, password, captcha)
+    if not result.get("success"):
+        return jsonify(result), 401
+    return jsonify(result)
 
-    class CleanSearchResponse(BaseModel):
-        success: bool = Field(..., description="Indicates if the query was successful")
-        timestamp: str = Field(default_factory=lambda: datetime.now().isoformat(), description="Response generation timestamp")
-        api_by: str = Field("t.me/Sudhirxd", description="API Author Credits")
-        website: str = Field("www.sudhirxd.in", description="Author Website")
-        message: str = Field("", description="Error message, if any")
-        search_type: str | None = Field(None)
-        search_value: str | None = Field(None)
-        card_details: CardDetails | None = Field(None, description="Structured card details")
-        members: list[FamilyMemberResponse] = Field([], description="List of registered family members")
-        status_metrics: StatusMetricsResponse = Field(default_factory=StatusMetricsResponse, description="Key status and warning flags")
-        raw_tables: list[dict] = Field([], description="Raw table data for debugging")
+@app.route("/api/auto-login", methods=["POST"])
+def auto_login_handler():
+    """
+    ZERO-FRICTION LOGIN — auto-solves captcha via OCR.
+    No need to manually solve captcha. Retries if OCR misreads.
+    """
+    data = request.json or {}
+    username = data.get("username")
+    password = data.get("password")
+    max_retries = data.get("max_retries", 3)
+    
+    if not username or not password:
+        return jsonify({"success": False, "error": "username and password are required"}), 400
+        
+    result = impds.auto_login(username, password, max_retries)
+    if not result.get("success"):
+        return jsonify(result), 401
+    return jsonify(result)
 
-    # ── Request Models ──
-    class LoginRequest(BaseModel):
-        username: str = Field(..., description="IMPDS username/email")
-        password: str = Field(..., description="IMPDS password")
-        captcha: str = Field(..., description="Captcha text from /api/captcha")
+@app.route("/api/search/ration-card", methods=["POST"])
+def search_ration_card_handler():
+    """Search deduplication records by ration card number. Auto-reauths if session expired."""
+    data = request.json or {}
+    card_number = data.get("card_number")
     
-    class AutoLoginRequest(BaseModel):
-        username: str = Field(..., description="IMPDS username/email")
-        password: str = Field(..., description="IMPDS password")
-        max_retries: int = Field(3, description="Max OCR attempts for captcha solving")
-    
-    class RationCardSearch(BaseModel):
-        card_number: str = Field(..., description="Ration card number", max_length=30)
-    
-    class AadhaarSearch(BaseModel):
-        aadhaar_number: str = Field(..., description="12-digit Aadhaar number", 
-                                   min_length=12, max_length=12)
-    
-    class ReportRequest(BaseModel):
-        report_path: str = Field(..., description="Report path from /api/reports list")
+    if not card_number:
+        return jsonify({"success": False, "error": "card_number is required"}), 400
+        
+    result = impds.search_by_ration_card(card_number)
+    if result.get('error') and 'not logged in' in result['error'].lower():
+        return jsonify(result), 401
+    return jsonify(result)
 
-    # ── Endpoints ──
+@app.route("/api/search/aadhaar", methods=["POST"])
+def search_aadhaar_handler():
+    """Search deduplication records by 12-digit Aadhaar number. Auto-reauths if session expired."""
+    data = request.json or {}
+    aadhaar_number = data.get("aadhaar_number")
     
-    @app.get("/docs")
-    async def custom_docs():
-        """Returns all available API endpoints with author credits in JSON format."""
-        return {
-            "success": True,
-            "api_by": "t.me/Sudhirxd",
-            "website": "www.sudhirxd.in",
-            "endpoints": [
-                "/aadhaar/{aadhaar_number}",
-                "/rc/{card_number}",
-                "/rc/summary/{card_number}"
-            ]
-        }
-    
-    @app.get("/api/health")
-    async def health():
-        """Check API health and session status."""
-        status = impds.get_status()
-        status["api_version"] = "1.0.0"
-        status["encryption_method"] = "CryptoJS AES-256-CBC"
-        return status
-    
-    @app.get("/api/captcha")
-    async def get_captcha():
-        """
-        Get a fresh captcha image. Call this before /api/login.
-        Returns base64-encoded JPG image.
-        """
-        impds.get_login_page()  # Also refreshes CSRF
-        captcha = impds.get_captcha()
-        return {
-            "captcha_image": f"data:image/jpg;base64,{captcha['captcha_base64']}",
-            "captcha_base64": captcha["captcha_base64"],
-            "instructions": "Decode the image and send the text to POST /api/login"
-        }
-    
-    @app.post("/api/login")
-    async def login(req: LoginRequest):
-        """
-        Login to IMPDS portal (manual captcha).
-        First call GET /api/captcha, solve it, then POST here.
-        """
-        result = impds.login(req.username, req.password, req.captcha)
-        if not result.get("success"):
-            raise HTTPException(status_code=401, detail=result)
-        return result
-    
-    @app.post("/api/auto-login")
-    async def auto_login(req: AutoLoginRequest):
-        """
-        🚀 ZERO-FRICTION LOGIN — auto-solves captcha via OCR.
-        No need to manually solve captcha. Retries if OCR misreads.
-        """
-        result = impds.auto_login(req.username, req.password, req.max_retries)
-        if not result.get("success"):
-            raise HTTPException(status_code=401, detail=result)
-        return result
-    
-    @app.post("/api/search/ration-card", response_model=CleanSearchResponse)
-    async def search_ration_card(req: RationCardSearch):
-        """Search deduplication records by ration card number. Auto-reauths if session expired."""
-        result = impds.search_by_ration_card(req.card_number)
-        if result.get('error') and 'not logged in' in result['error'].lower():
-            raise HTTPException(status_code=401, detail=result)
-        return result
-    
-    @app.post("/api/search/aadhaar", response_model=CleanSearchResponse)
-    async def search_aadhaar(req: AadhaarSearch):
-        """Search deduplication records by 12-digit Aadhaar number. Auto-reauths if session expired."""
-        result = impds.search_by_aadhaar(req.aadhaar_number)
-        if result.get('error') and 'not logged in' in result['error'].lower():
-            raise HTTPException(status_code=401, detail=result)
-        return result
-    
-    # ── DIRECT ONE-SHOT ENDPOINTS (zero friction) ──────────────────────
-    
-    @app.get("/aadhaar/{aadhaar_number}", response_model=CleanSearchResponse)
-    async def direct_aadhaar_search(aadhaar_number: str, user: str = None, pwd: str = None):
-        """
-        🔥 DIRECT SEARCH — Just hit this URL with a 12-digit Aadhaar.
+    if not aadhaar_number:
+        return jsonify({"success": False, "error": "aadhaar_number is required"}), 400
         
-        First time: GET /aadhaar/123456789012?user=YOUR_EMAIL&pwd=YOUR_PASSWORD
-        After that: GET /aadhaar/123456789012  (creds remembered, auto-reauth)
+    result = impds.search_by_aadhaar(aadhaar_number)
+    if result.get('error') and 'not logged in' in result['error'].lower():
+        return jsonify(result), 401
+    return jsonify(result)
+
+@app.route("/aadhaar/<aadhaar_number>", methods=["GET"])
+def direct_aadhaar_search(aadhaar_number):
+    """
+    DIRECT SEARCH — Just hit this URL with a 12-digit Aadhaar.
+    """
+    if len(aadhaar_number) != 12 or not aadhaar_number.isdigit():
+        return jsonify({"success": False, "error": "Aadhaar must be exactly 12 digits"}), 400
         
-        Auto-handles everything: login, captcha (OCR), encryption, parsing.
-        Returns clean JSON.
-        """
-        if len(aadhaar_number) != 12 or not aadhaar_number.isdigit():
-            raise HTTPException(status_code=400, detail="Aadhaar must be exactly 12 digits")
-        
-        # Store credentials if provided (one-time setup)
-        if user and pwd:
-            impds.username = user
-            impds.password = pwd
-            impds._auto_creds = {'username': user, 'password': pwd}
-            if not impds.logged_in:
-                result = impds.auto_login(user, pwd)
-                if not result.get('success'):
-                    raise HTTPException(status_code=401, detail=result)
-        
-        result = impds.search_by_aadhaar(aadhaar_number)
-        if result.get('error') and 'not logged in' in result['error'].lower():
-            raise HTTPException(status_code=401, 
-                detail="Not logged in. Add ?user=YOUR_EMAIL&pwd=YOUR_PASSWORD to the URL")
-        return result
+    user = request.args.get("user")
+    pwd = request.args.get("pwd")
     
-    @app.get("/rc/{card_number}", response_model=CleanSearchResponse)
-    async def direct_ration_card_search(card_number: str, user: str = None, pwd: str = None):
-        """
-        🔥 DIRECT SEARCH — Just hit this URL with a ration card number.
-        
-        First time: GET /rc/UP1234567890?user=YOUR_EMAIL&pwd=YOUR_PASSWORD
-        After that: GET /rc/UP1234567890  (creds remembered, auto-reauth)
-        
-        Auto-handles everything: login, captcha (OCR), encryption, parsing.
-        Returns clean JSON.
-        """
-        # Store credentials if provided (one-time setup)
-        if user and pwd:
-            impds.username = user
-            impds.password = pwd
-            impds._auto_creds = {'username': user, 'password': pwd}
-            if not impds.logged_in:
-                result = impds.auto_login(user, pwd)
-                if not result.get('success'):
-                    raise HTTPException(status_code=401, detail=result)
-        
-        result = impds.search_by_ration_card(card_number)
-        if result.get('error') and 'not logged in' in result['error'].lower():
-            raise HTTPException(status_code=401, 
-                detail="Not logged in. Add ?user=YOUR_EMAIL&pwd=YOUR_PASSWORD to the URL")
-        return result
+    # Store credentials if provided (one-time setup)
+    if user and pwd:
+        impds.username = user
+        impds.password = pwd
+        impds._auto_creds = {'username': user, 'password': pwd}
+        if not impds.logged_in:
+            result = impds.auto_login(user, pwd)
+            if not result.get('success'):
+                return jsonify(result), 401
+                
+    result = impds.search_by_aadhaar(aadhaar_number)
+    if result.get('error') and 'not logged in' in result['error'].lower():
+        return jsonify({"success": False, "error": "Not logged in. Add ?user=YOUR_EMAIL&pwd=YOUR_PASSWORD to the URL"}), 401
+    return jsonify(result)
+
+@app.route("/rc/<card_number>", methods=["GET"])
+def direct_ration_card_search(card_number):
+    """
+    DIRECT SEARCH — Just hit this URL with a ration card number.
+    """
+    user = request.args.get("user")
+    pwd = request.args.get("pwd")
     
-    @app.get("/rc/summary/{card_number}", response_model=CleanSearchResponse)
-    async def direct_rc_summary(card_number: str, user: str = None, pwd: str = None):
-        """
-        🔥 DIRECT RATION CARD SUMMARY — Fetches details from RcReportSummary.
+    # Store credentials if provided (one-time setup)
+    if user and pwd:
+        impds.username = user
+        impds.password = pwd
+        impds._auto_creds = {'username': user, 'password': pwd}
+        if not impds.logged_in:
+            result = impds.auto_login(user, pwd)
+            if not result.get('success'):
+                return jsonify(result), 401
+                
+    result = impds.search_by_ration_card(card_number)
+    if result.get('error') and 'not logged in' in result['error'].lower():
+        return jsonify({"success": False, "error": "Not logged in. Add ?user=YOUR_EMAIL&pwd=YOUR_PASSWORD to the URL"}), 401
+    return jsonify(result)
+
+@app.route("/rc/summary/<card_number>", methods=["GET"])
+def direct_rc_summary(card_number):
+    """
+    DIRECT RATION CARD SUMMARY — Fetches details from RcReportSummary.
+    """
+    user = request.args.get("user")
+    pwd = request.args.get("pwd")
+    
+    # Store credentials if provided (one-time setup)
+    if user and pwd:
+        impds.username = user
+        impds.password = pwd
+        impds._auto_creds = {'username': user, 'password': pwd}
+        if not impds.logged_in:
+            result = impds.auto_login(user, pwd)
+            if not result.get('success'):
+                return jsonify(result), 401
+                
+    # Ensure we are logged in
+    if not impds._ensure_logged_in():
+        return jsonify({"success": False, "error": "Not logged in and auto-login failed"}), 401
         
-        Usage: GET /rc/summary/102310142424684400000551
-        """
-        # Store credentials if provided (one-time setup)
-        if user and pwd:
-            impds.username = user
-            impds.password = pwd
-            impds._auto_creds = {'username': user, 'password': pwd}
-            if not impds.logged_in:
-                result = impds.auto_login(user, pwd)
-                if not result.get('success'):
-                    raise HTTPException(status_code=401, detail=result)
+    try:
+        r = impds.session.post(
+            f"{BASE_URL}/RcReportSummary",
+            data={'rationcardId': card_number},
+            timeout=15
+        )
+        if r.status_code == 200:
+            result = parse_search_results(r.text)
+            return jsonify(result)
+        else:
+            return jsonify({"success": False, "error": f"Upstream portal returned HTTP {r.status_code}"}), r.status_code
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/reports", methods=["GET"])
+def list_reports():
+    """List all available report endpoints."""
+    return jsonify({
+        "reports": AVAILABLE_REPORTS,
+        "usage": "POST /api/report with {\"report_path\": \"<path>\"} to fetch any report"
+    })
+
+@app.route("/api/report", methods=["POST"])
+def get_report_handler():
+    """Fetch any report from the portal and return parsed JSON. Auto-reauths if needed."""
+    data = request.json or {}
+    report_path = data.get("report_path")
+    if not report_path:
+        return jsonify({"success": False, "error": "report_path is required"}), 400
         
-        # Ensure we are logged in
-        if not impds._ensure_logged_in():
-            raise HTTPException(status_code=401, detail="Not logged in and auto-login failed")
-            
-        try:
-            r = impds.session.post(
-                f"{BASE_URL}/RcReportSummary",
-                data={'rationcardId': card_number},
-                timeout=15
-            )
-            if r.status_code == 200:
-                result = parse_search_results(r.text)
-                return result
-            else:
-                raise HTTPException(status_code=r.status_code, detail=f"Upstream portal returned HTTP {r.status_code}")
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-    
-    @app.get("/api/reports")
-    async def list_reports():
-        """List all available report endpoints."""
-        return {
-            "reports": AVAILABLE_REPORTS,
-            "usage": "POST /api/report with {\"report_path\": \"<path>\"} to fetch any report"
-        }
-    
-    @app.post("/api/report")
-    async def get_report(req: ReportRequest):
-        """Fetch any report from the portal and return parsed JSON. Auto-reauths if needed."""
-        result = impds.get_report(req.report_path)
-        if result.get('error') and 'not logged in' in result['error'].lower():
-            raise HTTPException(status_code=401, detail=result)
-        return result
-    
-    @app.post("/api/logout")
-    async def logout():
-        """Logout from the portal."""
-        return impds.logout()
+    result = impds.get_report(report_path)
+    if result.get('error') and 'not logged in' in result['error'].lower():
+        return jsonify(result), 401
+    return jsonify(result)
+
+@app.route("/api/logout", methods=["POST"])
+def logout_handler():
+    """Logout from the portal."""
+    return jsonify(impds.logout())
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# CLI MODE — For testing without FastAPI
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
+# CLI MODE
+# ===========================================================================
 
 def cli_mode():
     """Interactive CLI for testing the API."""
-    print("╔═══════════════════════════════════════════════════════╗")
-    print("║  IMPDS Deduplication — JSON API (CLI Mode)            ║")
-    print("║  Reverse-engineered search with AES encryption        ║")
-    print("╚═══════════════════════════════════════════════════════╝\n")
+    print("-------------------------------------------------------------")
+    print("     IMPDS Deduplication — JSON API (CLI Mode)            ")
+    print("     Reverse-engineered search with AES encryption        ")
+    print("-------------------------------------------------------------\n")
     
     client = IMPDSSession()
     
@@ -1277,7 +1219,7 @@ def cli_mode():
     captcha_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "captcha.jpg")
     with open(captcha_path, 'wb') as f:
         f.write(img_bytes)
-    print(f"[+] Captcha saved → {captcha_path}")
+    print(f"[+] Captcha saved -> {captcha_path}")
     
     username = input("\n  Username: ").strip()
     password = input("  Password: ").strip()
@@ -1320,7 +1262,7 @@ def cli_mode():
         elif choice == '4':
             print("\n  Available Reports:")
             for r in AVAILABLE_REPORTS:
-                print(f"    {r['path']:45s} → {r['name']}")
+                print(f"    {r['path']:45s} -> {r['name']}")
         
         elif choice == '5':
             client.logout()
@@ -1331,9 +1273,9 @@ def cli_mode():
             print("  Invalid choice.")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 # MAIN
-# ═══════════════════════════════════════════════════════════════════════════
+# ===========================================================================
 
 if __name__ == "__main__":
     import argparse
@@ -1345,7 +1287,7 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=8000, help='API server port')
     args = parser.parse_args()
     
-    if args.cli or not USE_FASTAPI:
+    if args.cli:
         cli_mode()
     else:
         # Configure auto-credentials if provided
@@ -1364,8 +1306,8 @@ if __name__ == "__main__":
                     print(f"[!] Auto-login failed: {result.get('error')}")
                     print("[!] Server will start anyway. Use /api/auto-login to retry.")
         
-        print("╔═══════════════════════════════════════════════════════╗")
-        print("║  IMPDS Deduplication — JSON API Server v2.0           ║")
-        print(f"║  http://localhost:{args.port}/docs  ← API Documentation JSON ║")
-        print("╚═══════════════════════════════════════════════════════╝")
-        uvicorn.run(app, host="0.0.0.0", port=args.port)
+        print("-------------------------------------------------------------")
+        print("   IMPDS Deduplication — Flask API Server v2.0")
+        print(f"   http://localhost:{args.port}/docs  — API Documentation JSON")
+        print("-------------------------------------------------------------")
+        app.run(host="0.0.0.0", port=args.port)
