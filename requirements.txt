@@ -3,3 +3,5 @@ flask-cors
 requests
 pycryptodome
 beautifulsoup4
+gunicorn
+python-dotenv
